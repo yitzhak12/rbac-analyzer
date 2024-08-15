@@ -63,7 +63,7 @@ func findGetCalls(filePath string) error {
 							if valueSpec.Type != nil {
 								vars[name.Name] = variableInfo{name: name.Name, typ: exprToString(valueSpec.Type)}
 							} else if i < len(valueSpec.Values) {
-								vars[name.Name] = variableInfo{name: name.Name, typ: inferType(valueSpec.Values[i])}
+								vars[name.Name] = variableInfo{name: name.Name, typ: inferType(valueSpec.Values[i], vars)}
 							}
 						}
 					}
@@ -74,7 +74,7 @@ func findGetCalls(filePath string) error {
 				for i, lhs := range x.Lhs {
 					if i < len(x.Rhs) {
 						if ident, ok := lhs.(*ast.Ident); ok {
-							vars[ident.Name] = variableInfo{name: ident.Name, typ: inferType(x.Rhs[i])}
+							vars[ident.Name] = variableInfo{name: ident.Name, typ: inferType(x.Rhs[i], vars)}
 						}
 					}
 				}
@@ -93,7 +93,7 @@ func findGetCalls(filePath string) error {
 							instanceArg := callExpr.Args[2]
 							fmt.Printf("Found r.Client.Get call in %s\n", filePath)
 							fmt.Printf("  Instance argument: %s\n", exprToString(instanceArg))
-							argType := inferType(instanceArg)
+							argType := inferType(instanceArg, vars)
 							if info, exists := vars[argType]; exists {
 								argType = info.typ
 							}
@@ -111,22 +111,27 @@ func findGetCalls(filePath string) error {
 	return nil
 }
 
-func inferType(expr ast.Expr) string {
+func inferType(expr ast.Expr, vars map[string]variableInfo) string {
 	switch e := expr.(type) {
 	case *ast.Ident:
+		if v, ok := vars[e.Name]; ok {
+			return v.typ
+		}
 		return e.Name
 	case *ast.SelectorExpr:
 		return exprToString(e)
 	case *ast.StarExpr:
-		return "*" + inferType(e.X)
+		return "*" + inferType(e.X, vars)
 	case *ast.UnaryExpr:
 		if e.Op == token.AND {
-			return "&" + inferType(e.X)
+			return "&" + inferType(e.X, vars)
 		}
 	case *ast.CallExpr:
-		return inferType(e.Fun) + "()"
+		return inferType(e.Fun, vars) + "()"
 	case *ast.CompositeLit:
 		return exprToString(e.Type)
+	case *ast.TypeAssertExpr:
+		return inferType(e.Type, vars)
 	}
 	return fmt.Sprintf("%T", expr)
 }
