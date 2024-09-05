@@ -1,154 +1,157 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"go/ast"
-	"go/parser"
-	"go/token"
+	"go/types"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
-type variableInfo struct {
-	name string
-	typ  string
+var clientMethodCallCount int
+var resourceName string
+
+// Function to append a value to a map, initializing the key if it doesn't exist
+func addValueToMap(m map[string][]string, key, value string) {
+	// Check if the key exists in the map
+	if _, exists := m[key]; !exists {
+		// If the key doesn't exist, initialize it with an empty slice
+		m[key] = []string{}
+	}
+	// Append the new value to the slice for that key
+	m[key] = append(m[key], value)
+}
+
+// removeDuplicatesFromSlice removes duplicate values from a slice of strings
+func removeDuplicatesFromSlice(slice []string) []string {
+	seen := make(map[string]bool)
+	result := []string{}
+
+	for _, value := range slice {
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+// removeDuplicatesFromMap removes duplicates from each slice in the map
+func removeDuplicatesFromMap(m map[string][]string) {
+	for key, slice := range m {
+		m[key] = removeDuplicatesFromSlice(slice)
+	}
+}
+
+// Function to print the map in a readable format
+func printMap(m map[string][]string) {
+	for key, values := range m {
+		fmt.Printf("%s: [", key)
+		for i, value := range values {
+			if i > 0 {
+				fmt.Print(", ")
+			}
+			fmt.Print(value)
+		}
+		fmt.Println("]")
+	}
+}
+
+func find_client_method_call(
+	pkgs []*packages.Package, methodName string, resourcePerListMethods map[string][]string,
+) {
+	targetPackage := "sigs.k8s.io/controller-runtime/pkg/client"
+
+	// Process each package
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Syntax {
+			ast.Inspect(file, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+						if sel.Sel.Name == methodName {
+							pos := pkg.Fset.Position(call.Pos())
+							// Find the package of the method
+							if methodObj := pkg.TypesInfo.ObjectOf(sel.Sel); methodObj != nil {
+								if methodObj.Pkg() != nil && methodObj.Pkg().Path() == targetPackage {
+									// Print results only if the method is from the desired package
+									fmt.Printf("Found %s in file: %s\n", methodName, pos.Filename)
+									fmt.Printf("Line: %d, Column: %d\n", pos.Line, pos.Column)
+
+									// Print the full selector expression
+									fmt.Printf("Full expression: %s\n", types.ExprString(sel))
+
+									// Print argument information with types and save the resource name
+
+									fmt.Printf("Arguments:\n")
+									for i, arg := range call.Args {
+										argType := pkg.TypesInfo.Types[arg].Type
+										fmt.Printf("  Arg %d: %s (Type: %s)\n", i+1, types.ExprString(arg), argType)
+										resourceName = argType.String()
+									}
+
+									// Print the method's receiver type, if available
+									if funcType, ok := methodObj.Type().(*types.Signature); ok {
+										if recv := funcType.Recv(); recv != nil {
+											fmt.Printf("Method of type: %s\n", recv.Type())
+										}
+									}
+									fmt.Printf("Defined in package: %s\n", methodObj.Pkg().Path())
+									fmt.Println("---")
+									clientMethodCallCount++
+									addValueToMap(resourcePerListMethods, resourceName, methodName)
+
+								}
+							}
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	removeDuplicatesFromMap(resourcePerListMethods)
+	fmt.Printf("Total method calls found: %d\n", clientMethodCallCount)
 }
 
 func main() {
-	repoPath := flag.String("repo", "", "Path to the repository")
-	flag.Parse()
-
-	if *repoPath == "" {
-		fmt.Println("Please provide a repository path using -repo flag")
-		return
+	if len(os.Args) != 2 {
+		fmt.Println("Usage: ./go-ast-analyzer <path_to_go_repo>")
+		os.Exit(1)
 	}
 
-	err := filepath.Walk(*repoPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() && filepath.Ext(path) == ".go" && !strings.Contains(path, "vendor") && !strings.Contains(path, "_test.go") {
-			if err := findGetCalls(path); err != nil {
-				log.Printf("Error processing file %s: %v\n", path, err)
-			}
-		}
-		return nil
-	})
-
+	repoPath, err := filepath.Abs(os.Args[1])
 	if err != nil {
-		fmt.Printf("Error walking the path %s: %v\n", *repoPath, err)
+		log.Fatalf("Error getting absolute path: %v", err)
 	}
-}
 
-func findGetCalls(filePath string) error {
-	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, filePath, nil, parser.AllErrors)
+	// Change to the repository directory
+	err = os.Chdir(repoPath)
 	if err != nil {
-		return fmt.Errorf("failed to parse file: %v", err)
+		log.Fatalf("Error changing to repository directory: %v", err)
 	}
 
-	vars := make(map[string]variableInfo)
-
-	// First pass: collect variable declarations
-	ast.Inspect(node, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.GenDecl:
-			if x.Tok == token.VAR {
-				for _, spec := range x.Specs {
-					if valueSpec, ok := spec.(*ast.ValueSpec); ok {
-						for i, name := range valueSpec.Names {
-							if valueSpec.Type != nil {
-								vars[name.Name] = variableInfo{name: name.Name, typ: exprToString(valueSpec.Type)}
-							} else if i < len(valueSpec.Values) {
-								vars[name.Name] = variableInfo{name: name.Name, typ: inferType(valueSpec.Values[i], vars)}
-							}
-						}
-					}
-				}
-			}
-		case *ast.AssignStmt:
-			if x.Tok == token.DEFINE {
-				for i, lhs := range x.Lhs {
-					if i < len(x.Rhs) {
-						if ident, ok := lhs.(*ast.Ident); ok {
-							vars[ident.Name] = variableInfo{name: ident.Name, typ: inferType(x.Rhs[i], vars)}
-						}
-					}
-				}
-			}
-		}
-		return true
-	})
-
-	// Second pass: find r.Client.Get calls
-	ast.Inspect(node, func(n ast.Node) bool {
-		if callExpr, ok := n.(*ast.CallExpr); ok {
-			if selectorExpr, ok := callExpr.Fun.(*ast.SelectorExpr); ok {
-				if xIdent, ok := selectorExpr.X.(*ast.SelectorExpr); ok {
-					if xIdent.Sel.Name == "Client" && selectorExpr.Sel.Name == "Get" {
-						if len(callExpr.Args) >= 3 {
-							instanceArg := callExpr.Args[2]
-							fmt.Printf("Found r.Client.Get call in %s\n", filePath)
-							fmt.Printf("  Instance argument: %s\n", exprToString(instanceArg))
-							argType := inferType(instanceArg, vars)
-							if info, exists := vars[argType]; exists {
-								argType = info.typ
-							}
-							fmt.Printf("  Inferred type: %s\n", argType)
-							fmt.Printf("  At position: %s\n", fset.Position(callExpr.Pos()))
-							fmt.Println()
-						}
-					}
-				}
-			}
-		}
-		return true
-	})
-
-	return nil
-}
-
-func inferType(expr ast.Expr, vars map[string]variableInfo) string {
-	switch e := expr.(type) {
-	case *ast.Ident:
-		if v, ok := vars[e.Name]; ok {
-			return v.typ
-		}
-		return e.Name
-	case *ast.SelectorExpr:
-		return exprToString(e)
-	case *ast.StarExpr:
-		return "*" + inferType(e.X, vars)
-	case *ast.UnaryExpr:
-		if e.Op == token.AND {
-			return "&" + inferType(e.X, vars)
-		}
-	case *ast.CallExpr:
-		return inferType(e.Fun, vars) + "()"
-	case *ast.CompositeLit:
-		return exprToString(e.Type)
-	case *ast.TypeAssertExpr:
-		return inferType(e.Type, vars)
+	// Configure the loader
+	cfg := &packages.Config{
+		Mode: packages.NeedFiles | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedTypes | packages.NeedImports,
+		// You might need to adjust this if your project uses modules
+		Dir: repoPath,
 	}
-	return fmt.Sprintf("%T", expr)
-}
 
-func exprToString(expr ast.Expr) string {
-	switch e := expr.(type) {
-	case *ast.Ident:
-		return e.Name
-	case *ast.SelectorExpr:
-		return exprToString(e.X) + "." + e.Sel.Name
-	case *ast.StarExpr:
-		return "*" + exprToString(e.X)
-	case *ast.CallExpr:
-		return exprToString(e.Fun) + "()"
-	case *ast.UnaryExpr:
-		return e.Op.String() + exprToString(e.X)
-	default:
-		return fmt.Sprintf("%T", expr)
+	// Load the packages
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		log.Fatalf("Error loading packages: %v", err)
 	}
+
+	resourcePerListMethods := make(map[string][]string)
+	method_names := []string{"Get", "Update", "Create", "Delete"}
+
+	for _, method_name := range method_names {
+		find_client_method_call(pkgs, method_name, resourcePerListMethods)
+	}
+	fmt.Println("Print the resources per list methods:")
+	printMap(resourcePerListMethods)
 }
