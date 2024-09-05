@@ -13,6 +13,13 @@ import (
 
 var clientMethodCallCount int
 var resourceName string
+var methodArgMap = map[string]int{
+	"Get":    3,
+	"Update": 2,
+	"Create": 2,
+	"Delete": 2,
+	"Patch":  2,
+}
 
 // Function to append a value to a map, initializing the key if it doesn't exist
 func addValueToMap(m map[string][]string, key, value string) {
@@ -60,7 +67,7 @@ func printMap(m map[string][]string) {
 	}
 }
 
-func find_client_method_call(
+func findClientMethodCall(
 	pkgs []*packages.Package, methodName string, resourcePerListMethods map[string][]string,
 ) {
 	targetPackage := "sigs.k8s.io/controller-runtime/pkg/client"
@@ -84,13 +91,11 @@ func find_client_method_call(
 									fmt.Printf("Full expression: %s\n", types.ExprString(sel))
 
 									// Print argument information with types and save the resource name
-
-									fmt.Printf("Arguments:\n")
-									for i, arg := range call.Args {
-										argType := pkg.TypesInfo.Types[arg].Type
-										fmt.Printf("  Arg %d: %s (Type: %s)\n", i+1, types.ExprString(arg), argType)
-										resourceName = argType.String()
-									}
+									idx := methodArgMap[methodName] - 1
+									arg := call.Args[idx]
+									argType := pkg.TypesInfo.Types[arg].Type
+									fmt.Printf("  Arg %d: %s (Type: %s)\n", idx, types.ExprString(arg), argType)
+									resourceName = argType.String()
 
 									// Print the method's receiver type, if available
 									if funcType, ok := methodObj.Type().(*types.Signature); ok {
@@ -147,10 +152,9 @@ func main() {
 	}
 
 	resourcePerListMethods := make(map[string][]string)
-	method_names := []string{"Get", "Update", "Create", "Delete"}
 
-	for _, method_name := range method_names {
-		find_client_method_call(pkgs, method_name, resourcePerListMethods)
+	for methodName, _ := range methodArgMap {
+		findClientMethodCall(pkgs, methodName, resourcePerListMethods)
 	}
 	fmt.Println("Print the resources per list methods:")
 	printMap(resourcePerListMethods)
