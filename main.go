@@ -1,12 +1,14 @@
 package main
 
 import (
-	"fmt"
-	"go/ast"
-	"go/types"
-	"log"
+	"flag"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"go/ast"
+	"go/types"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -24,11 +26,13 @@ var methodArgMap = map[string]int{
 type Analyzer struct {
 	clientMethodCallCount  int
 	resourcePerListMethods map[string]map[string]bool
+	logger                 *slog.Logger
 }
 
-func NewAnalyzer() *Analyzer {
+func NewAnalyzer(logger *slog.Logger) *Analyzer {
 	return &Analyzer{
 		resourcePerListMethods: make(map[string]map[string]bool),
+		logger:                 logger,
 	}
 }
 
@@ -39,13 +43,13 @@ func (a *Analyzer) addValueToMap(key, value string) {
 	a.resourcePerListMethods[key][value] = true
 }
 
-func (a *Analyzer) printMap() {
+func (a *Analyzer) logMap() {
 	for key, valueSet := range a.resourcePerListMethods {
 		values := make([]string, 0, len(valueSet))
 		for value := range valueSet {
 			values = append(values, value)
 		}
-		fmt.Printf("%s: %v\n", key, values)
+		a.logger.Info("Resource methods", "resource", key, "methods", values)
 	}
 }
 
@@ -70,41 +74,74 @@ func (a *Analyzer) findClientMethodCalls(pkgs []*packages.Package) {
 func (a *Analyzer) processMethodCall(pkg *packages.Package, call *ast.CallExpr, sel *ast.SelectorExpr, methodName string, argIndex int) {
 	if methodObj := pkg.TypesInfo.ObjectOf(sel.Sel); methodObj != nil && methodObj.Pkg() != nil && methodObj.Pkg().Path() == targetPackage {
 		pos := pkg.Fset.Position(call.Pos())
-		fmt.Printf("Found %s in file: %s\n", methodName, pos.Filename)
-		fmt.Printf("Line: %d, Column: %d\n", pos.Line, pos.Column)
-		fmt.Printf("Full expression: %s\n", types.ExprString(sel))
+		a.logger.Debug("Found method call",
+			"method", methodName,
+			"file", pos.Filename,
+			"line", pos.Line,
+			"column", pos.Column,
+			"expression", types.ExprString(sel),
+		)
 
 		arg := call.Args[argIndex-1]
 		argType := pkg.TypesInfo.Types[arg].Type
-		fmt.Printf("  Arg %d: %s (Type: %s)\n", argIndex, types.ExprString(arg), argType)
+		a.logger.Debug("Argument info",
+			"index", argIndex,
+			"expression", types.ExprString(arg),
+			"type", argType,
+		)
 		resourceName := argType.String()
 
 		if funcType, ok := methodObj.Type().(*types.Signature); ok {
 			if recv := funcType.Recv(); recv != nil {
-				fmt.Printf("Method of type: %s\n", recv.Type())
+				a.logger.Debug("Method receiver", "type", recv.Type())
 			}
 		}
-		fmt.Printf("Defined in package: %s\n", methodObj.Pkg().Path())
-		fmt.Println("---")
+		a.logger.Debug("Method definition", "package", methodObj.Pkg().Path())
 
 		a.clientMethodCallCount++
 		a.addValueToMap(resourceName, methodName)
 	}
 }
 
+func parseLogLevel(level string) slog.Level {
+	switch strings.ToUpper(level) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "INFO":
+		return slog.LevelInfo
+	case "WARN":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Usage: ./rbacanalyzer <path_to_go_repo>")
+	logLevel := flag.String("log-level", "INFO", "Set the logging level (DEBUG, INFO, WARN, ERROR)")
+	flag.Parse()
+
+	if flag.NArg() != 1 {
+		slog.Error("Invalid usage", "error", "Missing repository path")
+		slog.Info("Usage: ./rbacanalyzer -log-level=<level> <path_to_go_repo>")
 		os.Exit(1)
 	}
 
-	repoPath, err := filepath.Abs(os.Args[1])
+	level := parseLogLevel(*logLevel)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))
+
+	repoPath, err := filepath.Abs(flag.Arg(0))
 	if err != nil {
-		log.Fatalf("Error getting absolute path: %v", err)
+		logger.Error("Error getting absolute path", "error", err)
+		os.Exit(1)
 	}
 
 	if err := os.Chdir(repoPath); err != nil {
-		log.Fatalf("Error changing to repository directory: %v", err)
+		logger.Error("Error changing to repository directory", "error", err)
+		os.Exit(1)
 	}
 
 	cfg := &packages.Config{
@@ -114,13 +151,14 @@ func main() {
 
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
-		log.Fatalf("Error loading packages: %v", err)
+		logger.Error("Error loading packages", "error", err)
+		os.Exit(1)
 	}
 
-	analyzer := NewAnalyzer()
+	analyzer := NewAnalyzer(logger)
 	analyzer.findClientMethodCalls(pkgs)
 
-	fmt.Printf("Total method calls found: %d\n", analyzer.clientMethodCallCount)
-	fmt.Println("Resources per list methods:")
-	analyzer.printMap()
+	logger.Info("Analysis complete", "total method calls", analyzer.clientMethodCallCount)
+	logger.Info("Resources per list methods:")
+	analyzer.logMap()
 }
