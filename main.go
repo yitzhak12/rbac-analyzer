@@ -1,18 +1,20 @@
 package main
 
 import (
-	"fmt"
-	"go/ast"
-	"go/types"
-	"log"
+	"flag"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"go/ast"
+	"go/types"
 
 	"golang.org/x/tools/go/packages"
 )
 
-var clientMethodCallCount int
-var resourceName string
+const targetPackage = "sigs.k8s.io/controller-runtime/pkg/client"
+
 var methodArgMap = map[string]int{
 	"Get":    3,
 	"Update": 2,
@@ -21,95 +23,45 @@ var methodArgMap = map[string]int{
 	"Patch":  2,
 }
 
-// Function to append a value to a map, initializing the key if it doesn't exist
-func addValueToMap(m map[string][]string, key, value string) {
-	// Check if the key exists in the map
-	if _, exists := m[key]; !exists {
-		// If the key doesn't exist, initialize it with an empty slice
-		m[key] = []string{}
-	}
-	// Append the new value to the slice for that key
-	m[key] = append(m[key], value)
+type Analyzer struct {
+	clientMethodCallCount  int
+	resourcePerListMethods map[string]map[string]bool
+	logger                 *slog.Logger
 }
 
-// removeDuplicatesFromSlice removes duplicate values from a slice of strings
-func removeDuplicatesFromSlice(slice []string) []string {
-	seen := make(map[string]bool)
-	result := []string{}
+func NewAnalyzer(logger *slog.Logger) *Analyzer {
+	return &Analyzer{
+		resourcePerListMethods: make(map[string]map[string]bool),
+		logger:                 logger,
+	}
+}
 
-	for _, value := range slice {
-		if !seen[value] {
-			seen[value] = true
-			result = append(result, value)
+func (a *Analyzer) addValueToMap(key, value string) {
+	if _, exists := a.resourcePerListMethods[key]; !exists {
+		a.resourcePerListMethods[key] = make(map[string]bool)
+	}
+	a.resourcePerListMethods[key][value] = true
+}
+
+func (a *Analyzer) logMap() {
+	for key, valueSet := range a.resourcePerListMethods {
+		values := make([]string, 0, len(valueSet))
+		for value := range valueSet {
+			values = append(values, value)
 		}
-	}
-	return result
-}
-
-// removeDuplicatesFromMap removes duplicates from each slice in the map
-func removeDuplicatesFromMap(m map[string][]string) {
-	for key, slice := range m {
-		m[key] = removeDuplicatesFromSlice(slice)
+		a.logger.Info("Resource methods", "resource", key, "methods", values)
 	}
 }
 
-// Function to print the map in a readable format
-func printMap(m map[string][]string) {
-	for key, values := range m {
-		fmt.Printf("%s: [", key)
-		for i, value := range values {
-			if i > 0 {
-				fmt.Print(", ")
-			}
-			fmt.Print(value)
-		}
-		fmt.Println("]")
-	}
-}
-
-func findClientMethodCall(
-	pkgs []*packages.Package, methodName string, resourcePerListMethods map[string][]string,
-) {
-	targetPackage := "sigs.k8s.io/controller-runtime/pkg/client"
-
-	// Process each package
+func (a *Analyzer) findClientMethodCalls(pkgs []*packages.Package) {
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Syntax {
 			ast.Inspect(file, func(n ast.Node) bool {
 				if call, ok := n.(*ast.CallExpr); ok {
 					if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-						if sel.Sel.Name == methodName {
-							pos := pkg.Fset.Position(call.Pos())
-							// Find the package of the method
-							if methodObj := pkg.TypesInfo.ObjectOf(sel.Sel); methodObj != nil {
-								if methodObj.Pkg() != nil && methodObj.Pkg().Path() == targetPackage {
-									// Print results only if the method is from the desired package
-									fmt.Printf("Found %s in file: %s\n", methodName, pos.Filename)
-									fmt.Printf("Line: %d, Column: %d\n", pos.Line, pos.Column)
-
-									// Print the full selector expression
-									fmt.Printf("Full expression: %s\n", types.ExprString(sel))
-
-									// Print argument information with types and save the resource name
-									idx := methodArgMap[methodName] - 1
-									arg := call.Args[idx]
-									argType := pkg.TypesInfo.Types[arg].Type
-									fmt.Printf("  Arg %d: %s (Type: %s)\n", idx, types.ExprString(arg), argType)
-									resourceName = argType.String()
-
-									// Print the method's receiver type, if available
-									if funcType, ok := methodObj.Type().(*types.Signature); ok {
-										if recv := funcType.Recv(); recv != nil {
-											fmt.Printf("Method of type: %s\n", recv.Type())
-										}
-									}
-									fmt.Printf("Defined in package: %s\n", methodObj.Pkg().Path())
-									fmt.Println("---")
-									clientMethodCallCount++
-									addValueToMap(resourcePerListMethods, resourceName, methodName)
-
-								}
-							}
+						methodName := sel.Sel.Name
+						if argIndex, exists := methodArgMap[methodName]; exists {
+							a.processMethodCall(pkg, call, sel, methodName, argIndex)
 						}
 					}
 				}
@@ -117,45 +69,96 @@ func findClientMethodCall(
 			})
 		}
 	}
-	removeDuplicatesFromMap(resourcePerListMethods)
-	fmt.Printf("Total method calls found: %d\n", clientMethodCallCount)
+}
+
+func (a *Analyzer) processMethodCall(pkg *packages.Package, call *ast.CallExpr, sel *ast.SelectorExpr, methodName string, argIndex int) {
+	if methodObj := pkg.TypesInfo.ObjectOf(sel.Sel); methodObj != nil && methodObj.Pkg() != nil && methodObj.Pkg().Path() == targetPackage {
+		pos := pkg.Fset.Position(call.Pos())
+		a.logger.Debug("Found method call",
+			"method", methodName,
+			"file", pos.Filename,
+			"line", pos.Line,
+			"column", pos.Column,
+			"expression", types.ExprString(sel),
+		)
+
+		arg := call.Args[argIndex-1]
+		argType := pkg.TypesInfo.Types[arg].Type
+		a.logger.Debug("Argument info",
+			"index", argIndex,
+			"expression", types.ExprString(arg),
+			"type", argType,
+		)
+		resourceName := argType.String()
+
+		if funcType, ok := methodObj.Type().(*types.Signature); ok {
+			if recv := funcType.Recv(); recv != nil {
+				a.logger.Debug("Method receiver", "type", recv.Type())
+			}
+		}
+		a.logger.Debug("Method definition", "package", methodObj.Pkg().Path())
+
+		a.clientMethodCallCount++
+		a.addValueToMap(resourceName, methodName)
+	}
+}
+
+func parseLogLevel(level string) slog.Level {
+	switch strings.ToUpper(level) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "INFO":
+		return slog.LevelInfo
+	case "WARN":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Usage: ./go-ast-analyzer <path_to_go_repo>")
+	logLevel := flag.String("log-level", "INFO", "Set the logging level (DEBUG, INFO, WARN, ERROR)")
+	flag.Parse()
+
+	if flag.NArg() != 1 {
+		slog.Error("Invalid usage", "error", "Missing repository path")
+		slog.Info("Usage: ./rbacanalyzer -log-level=<level> <path_to_go_repo>")
 		os.Exit(1)
 	}
 
-	repoPath, err := filepath.Abs(os.Args[1])
+	level := parseLogLevel(*logLevel)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))
+
+	repoPath, err := filepath.Abs(flag.Arg(0))
 	if err != nil {
-		log.Fatalf("Error getting absolute path: %v", err)
+		logger.Error("Error getting absolute path", "error", err)
+		os.Exit(1)
 	}
 
-	// Change to the repository directory
-	err = os.Chdir(repoPath)
-	if err != nil {
-		log.Fatalf("Error changing to repository directory: %v", err)
+	if err := os.Chdir(repoPath); err != nil {
+		logger.Error("Error changing to repository directory", "error", err)
+		os.Exit(1)
 	}
 
-	// Configure the loader
 	cfg := &packages.Config{
 		Mode: packages.NeedFiles | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedTypes | packages.NeedImports,
-		// You might need to adjust this if your project uses modules
-		Dir: repoPath,
+		Dir:  repoPath,
 	}
 
-	// Load the packages
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
-		log.Fatalf("Error loading packages: %v", err)
+		logger.Error("Error loading packages", "error", err)
+		os.Exit(1)
 	}
 
-	resourcePerListMethods := make(map[string][]string)
+	analyzer := NewAnalyzer(logger)
+	analyzer.findClientMethodCalls(pkgs)
 
-	for methodName, _ := range methodArgMap {
-		findClientMethodCall(pkgs, methodName, resourcePerListMethods)
-	}
-	fmt.Println("Print the resources per list methods:")
-	printMap(resourcePerListMethods)
+	logger.Info("Analysis complete", "total method calls", analyzer.clientMethodCallCount)
+	logger.Info("Resources per list methods:")
+	analyzer.logMap()
 }
