@@ -2,13 +2,13 @@ package main
 
 import (
 	"flag"
+	"go/ast"
+	"go/types"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
-
-	"go/ast"
-	"go/types"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -27,12 +27,14 @@ type Analyzer struct {
 	clientMethodCallCount  int
 	resourcePerListMethods map[string]map[string]bool
 	logger                 *slog.Logger
+	displayResourcePath    bool
 }
 
-func NewAnalyzer(logger *slog.Logger) *Analyzer {
+func NewAnalyzer(logger *slog.Logger, displayResourcePath bool) *Analyzer {
 	return &Analyzer{
 		resourcePerListMethods: make(map[string]map[string]bool),
 		logger:                 logger,
+		displayResourcePath:    displayResourcePath,
 	}
 }
 
@@ -43,13 +45,46 @@ func (a *Analyzer) addValueToMap(key, value string) {
 	a.resourcePerListMethods[key][value] = true
 }
 
+// extractResourceName isolates the type name from the full package path (e.g., "v1.StorageCluster" -> "StorageCluster")
+func extractResourceName(fullName string) string {
+	// Split by "." to get the type name
+	parts := strings.Split(fullName, ".")
+	if len(parts) > 1 {
+		return parts[len(parts)-1] // Return the name after the last dot
+	}
+	return fullName // Fallback to the original name if parsing fails
+}
+
+// getKubernetesResourceName converts CamelCase to Kubernetes-style names (e.g., StorageCluster to storagecluster)
+func getKubernetesResourceName(s string) string {
+	// Regular expression to find camel case boundaries
+	var camelCasePattern = regexp.MustCompile("([a-z0-9])([A-Z])")
+	// Convert camel case to lowercase and concatenate words
+	resourceName := camelCasePattern.ReplaceAllString(s, "${1}${2}")
+	return strings.ToLower(resourceName)
+}
+
 func (a *Analyzer) logMap() {
 	for key, valueSet := range a.resourcePerListMethods {
 		values := make([]string, 0, len(valueSet))
 		for value := range valueSet {
 			values = append(values, value)
 		}
-		a.logger.Info("Resource methods", "resource", key, "methods", values)
+		// Use getKubernetesResourceName to get a more accurate Kubernetes resource name
+		resourceName := extractResourceName(key)
+		kubernetesResourceName := getKubernetesResourceName(resourceName)
+		if a.displayResourcePath {
+			a.logger.Info("Resource methods",
+				"fullResourceName", key,
+				"kubernetesResource", kubernetesResourceName,
+				"methods", values,
+			)
+		} else {
+			a.logger.Info("Resource methods",
+				"kubernetesResource", kubernetesResourceName,
+				"methods", values,
+			)
+		}
 	}
 }
 
@@ -120,11 +155,13 @@ func parseLogLevel(level string) slog.Level {
 
 func main() {
 	logLevel := flag.String("log-level", "INFO", "Set the logging level (DEBUG, INFO, WARN, ERROR)")
+	displayResourcePath := flag.Bool("display-resource-path", false, "Display the full package path for the resource in log output")
+
 	flag.Parse()
 
 	if flag.NArg() != 1 {
 		slog.Error("Invalid usage", "error", "Missing repository path")
-		slog.Info("Usage: ./rbacanalyzer -log-level=<level> <path_to_go_repo>")
+		slog.Info("Usage: ./rbacanalyzer -log-level=<level> -display-resource-path=<true|false> <path_to_go_repo>")
 		os.Exit(1)
 	}
 
@@ -155,7 +192,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	analyzer := NewAnalyzer(logger)
+	analyzer := NewAnalyzer(logger, *displayResourcePath)
 	analyzer.findClientMethodCalls(pkgs)
 
 	logger.Info("Analysis complete", "total method calls", analyzer.clientMethodCallCount)
