@@ -2,13 +2,13 @@ package main
 
 import (
 	"flag"
+	"go/ast"
+	"go/types"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
-
-	"go/ast"
-	"go/types"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -43,6 +43,25 @@ func (a *Analyzer) addValueToMap(key, value string) {
 	a.resourcePerListMethods[key][value] = true
 }
 
+// extractResourceName isolates the type name from the full package path (e.g., "v1.StorageCluster" -> "StorageCluster")
+func extractResourceName(fullName string) string {
+	// Split by "." to get the type name
+	parts := strings.Split(fullName, ".")
+	if len(parts) > 1 {
+		return parts[len(parts)-1] // Return the name after the last dot
+	}
+	return fullName // Fallback to the original name if parsing fails
+}
+
+// getKubernetesResourceName converts CamelCase to Kubernetes-style names (e.g., StorageCluster to storagecluster)
+func getKubernetesResourceName(s string) string {
+	// Regular expression to find camel case boundaries
+	var camelCasePattern = regexp.MustCompile("([a-z0-9])([A-Z])")
+	// Convert camel case to lowercase and concatenate words
+	resourceName := camelCasePattern.ReplaceAllString(s, "${1}${2}")
+	return strings.ToLower(resourceName)
+}
+
 func (a *Analyzer) logMap() {
 	for key, valueSet := range a.resourcePerListMethods {
 		values := make([]string, 0, len(valueSet))
@@ -50,6 +69,14 @@ func (a *Analyzer) logMap() {
 			values = append(values, value)
 		}
 		a.logger.Info("Resource methods", "resource", key, "methods", values)
+		// Use getKubernetesResourceName to get a more accurate Kubernetes resource name
+		resourceName := extractResourceName(key)
+		kubernetesResourceName := getKubernetesResourceName(resourceName)
+		a.logger.Info("Resource methods",
+			"Full resource name", key,
+			"Resource name", kubernetesResourceName,
+			"methods", values,
+		)
 	}
 }
 
