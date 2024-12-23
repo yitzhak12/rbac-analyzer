@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"go/ast"
 	"go/types"
 	"log/slog"
@@ -73,18 +74,17 @@ func (a *Analyzer) logMap() {
 		// Use getKubernetesResourceName to get a more accurate Kubernetes resource name
 		resourceName := extractResourceName(key)
 		kubernetesResourceName := getKubernetesResourceName(resourceName)
+
+		var output string
 		if a.displayResourcePath {
-			a.logger.Info("Resource methods",
-				"fullResourceName", key,
-				"kubernetesResource", kubernetesResourceName,
-				"methods", values,
+			output = fmt.Sprintf(
+				"Full Resource Name: %s\nResource: %s\nMethods: [%s]\n",
+				key, kubernetesResourceName, strings.Join(values, ", "),
 			)
 		} else {
-			a.logger.Info("Resource methods",
-				"kubernetesResource", kubernetesResourceName,
-				"methods", values,
-			)
+			output = fmt.Sprintf("Resource: %s\nMethods: [%s]\n", kubernetesResourceName, strings.Join(values, ", "))
 		}
+		fmt.Println(output)
 	}
 }
 
